@@ -28,7 +28,7 @@ Features:
     - `Retry`: Restarts the current state without transitioning.
 
 3. Error Handling:
-    - Custom exceptions for various error conditions (e.g., `StateRetryLimitError`, `StateTimedOut`).
+    - Custom handlers for various error conditions (e.g., Retry limits, timeouts).
     - Default error state for handling unhandled exceptions.
 
 4. Timeout and Retry:
@@ -47,7 +47,6 @@ Usage:
 
 Exceptions:
 - `StateRetryLimitError`: Raised when a state exceeds its retry limit.
-- `StateTimedOut`: Raised when a state exceeds its timeout duration.
 - `MissingOnStateHandler`: Raised when a state does not define an `on_state` handler.
 - `EmptyStateStackError`: Raised when attempting to pop from an empty state stack.
 - `NoPushedStatesError`: Raised when no states are provided to a `Push` transition.
@@ -59,13 +58,9 @@ Exceptions:
 import collections
 from dataclasses import dataclass, field
 from datetime import datetime
-from queue import Queue
+from queue import PriorityQueue, Empty
 from threading import Timer
-from typing import Any
-
-
-class StateRetryLimitError(Exception):
-    pass
+from typing import Any, Union, Optional, Type
 
 
 class StateMachineComplete(Exception):
@@ -73,10 +68,6 @@ class StateMachineComplete(Exception):
 
 
 class MissingOnStateHandler(Exception):
-    pass
-
-
-class StateTimedOut(Exception):
     pass
 
 
@@ -96,95 +87,203 @@ class NonBlockingStalled(Exception):
     pass
 
 
+class InvalidTransition(Exception):
+    pass
+
+
+class StateRetryLimitError(Exception):
+    pass
+
+
 class BlockedInUntimedState(Exception):
     def __init__(self, state):
-        super().__init__(f"Blocking on state without a timer: {state_name(state)}")
+        super().__init__(f"Blocking on state without a timer: {state.name}")
         self.state = state
 
 
-def state_name(descriptor):
-    if hasattr(descriptor, "__name__"):
-        return descriptor.__name__
-    elif hasattr(descriptor, "name"):
-        return descriptor.name
+class ClassPropertyDescriptor:
+    def __init__(self, fget):
+        self.fget = fget
+
+    def __get__(self, obj, klass=None):
+        if klass is None:
+            klass = type(obj)
+        return self.fget(klass)
 
 
-def base_state_name(descriptor):
-    if hasattr(descriptor, "__bases__"):
-        return descriptor.__bases__[0].__name__
-    elif hasattr(descriptor, "__class__"):
-        return descriptor.__class__.__bases__[0].__name__
+@dataclass
+class EnokiInternalMessage:
+    state: "State"
 
 
-class State:
-    """States are the workhorses of the enoki library. User states
-    should inherit from State and provide on_enter/on_leave/on_fail/on_timeout
-    methods (as appropriate, pass-through defaults are provided), and MUST
-    provide on on_state handler.
+@dataclass
+class StateTimedOut(EnokiInternalMessage):
+    timeout: int
 
-    on_enter/on_leave are fired once on entry and on leaving the state. These
-    methods should return nothing as they are incapable of affecting the
-    transitioning of the state machine.
 
-    on_state is the main/required method of each state. on_state should return
-    one of several options:
+def classproperty(func):
+    return ClassPropertyDescriptor(func)
 
-    * Returning 'None' (or simply letting the function exit) indicates that the
-    FSM will remain in the current state, and that if there was a message passed
-    in, it was not handled (which will cause the message to be trapped by the
-    encapsulating FSM). On the next tick, the state will begin from its on_state
-    method. Note that this is essentially a 'wait' and if the state does not
-    have a timeout defined, and it is not included in the FSM's 'dwell states',
-    an error will be thrown as the FSM could otherwise be stalled indefinitely
-    (See the section on TIMEOUT).
 
-    * Returning 'Repeat' indicates that the state swallowed the message that
-    it was passed. On the next tick, the same state will begin from its on_enter
-    method. This is a transition from the current state back to a new instance
-    of the same state.
+@dataclass(order=True)
+class PrioritizedMessage:
+    priority: int
+    item: Any = field(compare=False)
 
-    * Returning the constructor (not an instance!) of the current state will
-    immediately retry the current state starting from on_enter. This will cause
-    the FSM's retry counter to be decremented, and if the retry limit is
-    reached, the on_fail handler will be called.
 
-    * Returning another state's constructor (Not an instance!) is a
-    transition. The FSM will fire the current on_leave handler (if it exists)
-    and transition to the next state, first calling its on_enter, and then it's
-    on_state handler. This is the most common way to transition between states.
+# TODO: Maybe change AWAITS to IMMEDIATE?
+@dataclass
+class TransitionType:
 
-    * Returning 'Push' with any number of state constructors as 
-    arguments will transtiion to the first state and push the  rest onto the
-    state stack. Example: Push(State1, State2, State3) would transition to
-    State1 and then when a 'Pop' is encountered, State2 would be popped off the
-    stack and transitioned to. Note that 'Pushing' a single state is
-    functionally equivalent to a 'Transition' to that state.
+    # A transition that awaits will require backing out to the FSM loop to await
+    # an event or message
+    AWAITS: bool = False
 
-    * Returning 'Pop' will pop the top state off the stack and transition to
-    that state. If the stack is empty, an EmptyStateStackError will be raised.
+    @classproperty
+    def name(cls):
+        return cls.__name__
 
-    States may also provide TIMEOUT and RETRIES class variables.
+    @classproperty
+    def base_name(cls):
+        if hasattr(cls, "__bases__"):
+            return cls.__bases__[0].name
+        return cls.name
 
-    TIMEOUT specifies the duration of a failsafe timer in seconds that is
-    started when a state is entered, and cancelled when a state successfully
-    transitions. If the user has provided an on_timeout state, it will be called
-    in response to this event. on_timeout may return None, which will cause the
-    state machine's default error state to be entered, the descriptor of the
-    current state, which will reset the timer, or the descriptor of a specific
-    error state. 
 
-    RETRIES specifies how many times a state may be retried before an error
-    condition is flagged (default is None (infinite)). When this error condition
-    occurs, the 'on_fail' handler will be called if it exists. on_fail may
-    return None, which will cause the state machine's default error state to be
-    entered, or the descriptor of a specific error state may be returned.
+# Transition Categories
 
+
+@dataclass
+class StateTransition(TransitionType):
+    """Represents a transition to a different state"""
+
+    pass
+
+
+@dataclass
+class StateContinuation(TransitionType):
+    """Represents staying in the same state."""
+
+    pass
+
+
+@dataclass
+class StateRenewal(TransitionType):
+    """Represents a transition back into the current state"""
+
+
+# TODO: Rethink this name?
+@dataclass
+class Again(StateContinuation):
+    """Executes the current state immediately from on_state without affecting
+    the retry counter.
+
+    NOTE: This is synonymous with returning `self`
     """
 
-    # TIMEOUT and RETRIES can and should be overridden by child
-    # classes that require either of these bits of functionality
+    pass
+
+
+@dataclass
+class Unhandled(StateContinuation):
+    """Executes the current state from on_state without affecting the retry
+    counter on the next event or message.
+
+    NOTE: This is synonymous with returning `None`
+    """
+
+    AWAITS = True
+
+
+@dataclass
+class Retry(StateContinuation):
+    """Retries the current state, decrementing it's
+    retry counter and immediately beginning execution from on_enter."""
+
+    pass
+
+
+@dataclass
+class Restart(StateRenewal):
+    """Restarts the current state, resetting
+    the retry counter, and awaiting a message or event to begin from
+    on_enter."""
+
+    AWAITS = True
+
+
+@dataclass
+class Repeat(StateRenewal):
+    """Repeats the current state. The retry
+    counter is reset, and the state immediately begins execution from  on_enter.
+
+    NOTE: This is synonymous with returning `type(self)` OR the constructor for
+    the current state (i.e it acts like any other state transition aside from NOT firing on_exit)
+    """
+
+    pass
+
+
+class State(StateTransition):
+    """
+    The base class for all user-defined states in the Enoki FSM library.
+
+    States are the workhorses of the FSM. To define a state, subclass State and implement at least the `on_state` method.
+    Optionally, you may override `on_enter`, `on_leave`, `on_fail`, and `on_timeout` for custom entry/exit/failure/timeout behavior.
+
+    ---
+    **State Lifecycle Methods:**
+      - `on_enter(shared)`: Called once when entering the state. Use for setup. Does not affect transitions.
+      - `on_leave(shared)`: Called once when leaving the state. Use for cleanup. Does not affect transitions.
+      - `on_state(shared)`: Main handler for state logic. Must be implemented. Controls transitions.
+      - `on_fail(shared)`: Called when retry limit is reached. May return a new state or None.
+      - `on_timeout(shared)`: Called when timeout is reached. May return a new state, self, or None.
+
+    ---
+    **Transition Return Values (from `on_state`, `on_fail`, `on_timeout`):**
+      - `None`: No transition; FSM remains in current state and waits for next message ("wait").
+      - `self`: Immediate continuation (Again); FSM re-enters current state from `on_state` (does not reset retries/timer).
+      - `type(self)`: Renewal (Repeat); FSM restarts current state from `on_enter` (resets retries/timer).
+      - `Restart`: FSM resets retry counter, re-enters state from `on_enter`, and waits for next message.
+      - `Retry`: FSM decrements retry counter, re-enters state from `on_enter` immediately.
+      - Another state class: FSM transitions to that state, calling `on_leave` and then new state's `on_enter`/`on_state`.
+      - `Push(StateA, StateB, ...)`: FSM pushes states onto stack, transitions to first; supports pushdown automata.
+      - `Pop`: FSM pops the top state from stack and transitions to it.
+
+    ---
+    **Timeouts and Retries:**
+      - Set `TIMEOUT` (seconds) to enable automatic timeout and `on_timeout` handling. This is REQUIRED for states that might wait on a specific message
+      - Set `RETRIES` (int) to enable retry limit and `on_fail` handling.
+      - Returning self/type(self) from `on_timeout` resets timer/retries as appropriate.
+      - Retry/timeout logic is handled automatically by the FSM.
+
+    ---
+    **Stack/Pushdown Automata:**
+      - Use `Push` and `Pop` to implement stack-based state transitions.
+      - Pushing a single state is equivalent to a direct transition.
+      - Popping with an empty stack raises `EmptyStateStackError`.
+
+    ---
+    **Error Handling:**
+      - Unhandled transitions raise `InvalidTransition`.
+      - Missing `on_state` raises `MissingOnStateHandler`.
+      - Retry/timeout errors raise `StateRetryLimitError`/`StateTimedOut`.
+      - FSM can be configured with custom error states and error handlers.
+
+    ---
+    **Edge Cases and Best Practices:**
+      - Continuations (Again) do not reset retries/timers; renewals (Repeat) do.
+      - Shared state (`SharedState`) is passed to all methods for communication between states.
+      - All transitions should return state classes, not instances (except Push).
+      - Use `TERMINAL = True` to mark a state as terminal.
+
+    See the Enoki documentation and test suite for more usage examples and edge case handling.
+    """
+
     TIMEOUT = None
     RETRIES = None
+    TERMINAL = False
+    CAN_DWELL = False
 
     def __init__(self):
         self._tries = None
@@ -192,23 +291,28 @@ class State:
         self._reset()
 
     def _reset(self):
-        if self.RETRIES is not None:
-            self._tries = self.RETRIES + 1
-        else:
-            self._tries = None
+        self._reset_retries()
         self._cancel_failsafe()
         self.has_entered = False
 
-    def on_enter(self, shared):
+    def _reset_retries(self):
+        if self.RETRIES is not None:
+            self._tries = self.RETRIES + 1
+
+    def on_state(self, ctx: "SharedContext"):
+        """This method MUST be overriden by state implementations"""
+        raise MissingOnStateHandler(f"State {self.name} has no on_state handler")
+
+    def on_enter(self, ctx: "SharedContext"):
         pass
 
-    def on_leave(self, shared):
+    def on_leave(self, ctx: "SharedContext"):
         pass
 
-    def on_fail(self, shared):
+    def on_fail(self, ctx: "SharedContext"):
         pass
 
-    def on_timeout(self, shared):
+    def on_timeout(self, ctx: "SharedContext"):
         return self
 
     def _cancel_failsafe(self):
@@ -216,119 +320,196 @@ class State:
             self._failsafe_timer.cancel()
             self._failsafe_timer = None
 
-    def _start_failsafe(self, evt):
-        self._failsafe_timer = evt.fsm.start_failsafe_timer(self.TIMEOUT)
+    def _start_failsafe(self, fsm: "StateMachine"):
+        self._failsafe_timer = fsm._start_failsafe_timer(self.TIMEOUT)
         self._failsafe_timer.start()
 
     def _handle_retries(self):
         if self._tries is None:
             return
         elif self._tries == 0:
-            raise StateRetryLimitError(
-                f"State: {self.name} exceeded its maximum retry limit of {self.RETRIES} (retries {self._tries})"
-            )
+            raise StateRetryLimitError()
+        else:
+            self._tries -= 1
 
-        self._tries -= 1
-
-    def _maybe_failsafe_timer(self, evt):
+    def _maybe_failsafe_timer(self, fsm: "StateMachine"):
         if self.TIMEOUT:
             self._cancel_failsafe()
-            self._start_failsafe(evt)
+            self._start_failsafe(fsm)
 
-    def _wrap_enter(self, evt, fn=None):
-        self._handle_retries()
+    def _handle_timeout(self, fsm: "StateMachine", ctx:"SharedContext"):
+        fsm.log(f"{self} in _handle_timeout")
 
-        if fn:
-            fn(evt)
-
-        self._maybe_failsafe_timer(evt)
-        self.has_entered = True
-
-    def _wrap_leave(self, evt, fn=None):
-        if fn:
-            fn(evt)
-        self._reset()
-
-    def _handle_timeout(self, shared_state):
-        result = self.on_timeout(shared_state)
-        if not result:
-            result = shared_state.fsm._err_st
+        # TODO: Document this behavior w/r/t self timed states
+        result = self.on_timeout(ctx) or fsm._err_state
 
         # If we return ourselves from a timeout, this means that this
         # is a 'self ticking' state and we need to check our retries
         # and reset our timer
-        if result is not None and state_name(result) == self.name:
+        if result is not None and result.name == self.name:
             self.has_entered = False
             # Make sure that our timer is cancelled (in case out of order)
             self._cancel_failsafe()
-            if isinstance(shared_state.msg, Exception):
-                shared_state.msg = None
+            if isinstance(ctx.msg, StateTimedOut):
+                ctx.msg = None
+            # Force a tick
+            fsm.send_message(None)
 
         return result
 
-    def tick(self, shared_state):
+    def _tick(self, fsm: "StateMachine", ctx: "SharedContext") -> TransitionType:
         result = None
 
-        if isinstance(shared_state.msg, StateTimedOut):
-            result = self._handle_timeout(shared_state)
-            return result
-        elif isinstance(shared_state.msg, StateRetryLimitError):
-            result = self.on_fail(shared_state)
-            if not result:
-                result = shared_state.fsm._err_st
-            return result
+        if isinstance(ctx.msg, StateTimedOut):
+            if ctx.msg.state.name != self.name:
+                fsm.log(
+                    f"Timeout for prior state {ctx.msg.state.name} fired during {self.name}, ignoring"
+                )
+            else:
+                fsm.log(f"This timeout is for {self}, proceeding")
+                result = self._handle_timeout(fsm, ctx)
         else:
-            if not self.has_entered:
-                self.on_enter_handler(shared_state)
+            try:
+                if not self.has_entered:
+                    self._on_enter(fsm, ctx)
+                result = self.on_state(ctx)
+            except StateRetryLimitError:
+                fsm.log(
+                    f"State: {self.name} exceeded its maximum retry limit of {self.RETRIES} (retries {self._tries})"
+                )
+                result = self.on_fail(ctx) or fsm._err_state
 
-            result = self.on_state_handler(shared_state)
+        sanitized_result = self._sanitize_state_result(fsm, ctx, result)
 
-            # Early exit, this is a wait condition
-            if result in BLOCKING_RETURNS:
+        # If we're leaving for another state, we need to call on_leave
+        if isinstance(sanitized_result, Push) or issubclass(
+            sanitized_result, StateTransition
+        ):
+            self._on_leave(ctx)
+
+        return sanitized_result
+
+    def _on_enter(self, fsm: "StateMachine", ctx: "SharedContext"):
+        self._handle_retries()
+
+        self.on_enter(ctx)
+
+        self._maybe_failsafe_timer(fsm)
+        self.has_entered = True
+
+    # TODO: Add warning for aliases except None
+
+    def _sanitize_state_result(self, fsm: "StateMachine", ctx: "SharedContext", result: Any):
+        # sanitize our return values
+        match result:
+            case None:
+                # We alias None to Unhandled
+                return Unhandled
+            case s if s is self:
+                # We alias 'self' to Again
+                return Again
+            case type() if result is type(self):
+                # we alias type(self) to Repeat
+                return Repeat
+            case type() if result in (
+                StateContinuation,
+                StateTransition,
+                StateRenewal,
+                TransitionType,
+            ):
+                # We don't allow direct use of our categories or the base class
+                raise InvalidTransition(
+                    f"{result} is not a valid transition. Direct use of base base classes / categories is not allowed"
+                )
+            case type() if issubclass(
+                result, (StateContinuation, StateRenewal, State, Pop)
+            ):
+                # Continuations/Renewals/Pop/States are passed on
                 return result
+            case t if isinstance(t, (StateContinuation, StateRenewal, Pop, State)):
+                # Returning instances of Continuation/Renewal subtypes, and all
+                # transitions aside from Push are accepted, we just buck them
+                # back down to a constructor for consistency and warn the user
+                fsm.log(
+                    f"WARNING: {self.name} returned an instance of {type(t)}, please return a constructor (return State instead of State()) "
+                )
+                return type(t)
+            case p if isinstance(p, Push):
+                # Push is returned as an instance since we need the state it
+                # contains, HOWEVER: there are some edge cases that we'll handle
+                # here
 
-            # If a State intentionally returns itself, this is a retry and
-            # we should re-enter on the next tick
-            if result == type(self):
-                self.has_entered = False
-                self._cancel_failsafe()
-                return result
+                # We don't allow an empty push
+                if not p.push_states:
+                    raise InvalidPushError(
+                        f"{self.name} attempted a push with no states provided"
+                    )
 
-        # If we got a new state, we should fire our on_leave handler,
-        # and the next state's on_enter, then return the new state
-        self.on_leave_handler(shared_state)
-        return result
+                # We only support direct state transitions in Push
+                # therefore we need to sanitize all of our substates, and then
+                # verify that everything contained therein is valid
+                sanitized_states = [
+                    self._sanitize_state_result(fsm, ctx, x) for x in p.push_states
+                ]
 
-    @property
-    def name(self):
-        return self.__class__.__name__
+                # Now we need to ensure that:
+                #
+                # - Any repeats are transformed to type(self)
+                # - All of the elements in the sanitized list are States
+                # - type(self) ONLY shows up as the last element in the list
 
-    def on_enter_handler(self, evt):
-        return self._wrap_enter(evt, self.on_enter)
+                # Repeat/type(self) allows us to do circular patterns like
+                # Push(Foo, Bar, Baz, enoki.Repeat), coming back to the current
+                # state after doing other things. We only allow this when
+                # type(self) exists at the end of a list of > 1 states to avoid
+                # accidental inescapable loops
+                for idx, val in enumerate(sanitized_states):
+                    if issubclass(val, Repeat):
+                        sanitized_states[idx] = type(self)
 
-    def on_state_handler(self, evt):
-        if hasattr(self, "on_state"):
-            return self.on_state(evt)
-        else:
-            raise MissingOnStateHandler(f"State {self.name} has no on_state handler!")
+                    if not issubclass(sanitized_states[idx], State):
+                        raise InvalidPushError(
+                            f"{self.name} attempted to push {val.name}. Only pushing States/Repeat is supported"
+                        )
 
-    def on_leave_handler(self, evt):
-        return self._wrap_leave(evt, self.on_leave)
+                    if issubclass(sanitized_states[idx], type(self)):
+                        is_last = idx == len(sanitized_states) - 1
+                        if idx == 0:
+                            raise InvalidPushError(
+                                f"{self.name} attempted to Push itself as the first state in a push stack"
+                            )
 
+                        if not is_last:
+                            raise InvalidPushError(
+                                f"{self.name} attempted to Push itself in a position that was not last in a series of pushed states"
+                            )
 
-@dataclass
-class TransitionType:
-    def name(self):
-        return self.__class__.__name__
+                # A push of a single state is just an alias for a transition, so
+                # we can avoid the push mechanism altogether
+                if len(sanitized_states) == 1:
+                    return sanitized_states[0]
+
+                p.push_states = sanitized_states
+                return p
+            case _:
+                raise InvalidTransition(f"{t} is not a valid transition")
+
+    def _on_leave(self, ctx):
+        self.on_leave(ctx)
+        self._reset()
 
 
 @dataclass(init=False)
-class Push(TransitionType):
+class Push(StateTransition):
     """
-    Represents a transition type where one or more states are pushed onto the stack.
+    Represents a transition type where one or more states are pushed onto the
+    stack.
+
+    Pushing a single state is synonymous with a transition.
 
     Args:
-        *push_states (List[Type[State]]): A variable number of state classes to be pushed onto the stack.
+        *push_states (List[Type[State]]): A variable number of state classes to
+        be pushed onto the stack.
     """
 
     push_states: list[type[State]]
@@ -338,28 +519,29 @@ class Push(TransitionType):
 
 
 @dataclass
-class Pop(TransitionType):
+class Pop(StateTransition):
+    """Pops the top state off the stack and transitions to it."""
+
     pass
-
-
-@dataclass
-class Repeat(TransitionType):
-    pass
-
-
-# NOTE: typically I'd define this above the State class, but I want to use
-# `State` for the push type definition and didn't want to separate where they're
-# defined
-BLOCKING_RETURNS = [None, Repeat]
 
 
 # End is a default state that any FSM can use
 class DefaultStates:
     class End(State):
-        def on_state(self, evt):
+        TERMINAL = True
+
+        def on_state(self, ctx):
+            pass
+
+    class Error(State):
+        TERMINAL = True
+
+        def on_state(self, ctx):
+            ctx.log("Default Error State")
             pass
 
 
+# TODO: Think about just making this optional and None, this feels silly
 @dataclass
 class GenericCommon:
     """This is an empty container class to hold any carry-over state in
@@ -367,26 +549,37 @@ class GenericCommon:
 
     """
 
+    pass
 
+
+# TODO: Rethink this name
 @dataclass
-class SharedState:
-    """SharedState is passed to each state to allow states to share
-    information downstream. The shared state object contains a
-    reference to the higher level state machine (SharedState.fsm) and
-    a common state object (SharedState.common), which may be user
-    supplied during state machine instantiation.
+class SharedContext:
+    """SharedContesxt is passed to each state to allow states to share
+    information downstream and access critical functionality like sending
+    messages. The shared state object contains a reference to a common state
+    object (SharedState.common), which may be user supplied during state machine
+    instantiation.  It also contains the first message in the message queue (if
+    any).
 
     """
+    send_message: callable
+    log: callable
+    common: Any
+    msg: Optional[Any] = None
 
-    fsm: "StateMachine"
-    common: Any = field(default_factory=GenericCommon)
+
+# TODO: Test _do_nothing works as I hope it will...
+_do_nothing = lambda x: None
 
 
 class StateMachine:
+    MESSAGE_PRIORITY = 2
+    INTERNAL_MESSAGE_PRIORITY = 1
+    ERROR_PRIORITY = 0
     """The StateMachine object is responsible for managing state
     transitions and bookkeeping shared state. On instantiation, the
-    user must supply initial, final, and default error states (which
-    must be subclasses of State).
+    user must supply an initial state (which MUST be a subclass of enoki.State)
 
     Additionally, the user MAY supply a Queue object (msg_queue) which will be
     used to pass messages into states (and relay information about timeouts and
@@ -415,35 +608,30 @@ class StateMachine:
     def __init__(
         self,
         initial_state,
-        final_state,
-        default_error_state,
-        msg_queue=None,
+        error_state=DefaultStates.Error,
         filter_fn=None,
         trap_fn=None,
         on_error_fn=None,
         log_fn=print,
         transition_fn=None,
         common_data=None,
-        dwell_states=None,
     ):
 
         # We want to make sure that initial/final/default_err states
         # are descriptors, not instances
-        for state in [initial_state, final_state, default_error_state]:
-            if isinstance(state, State):
-                raise TypeError(
-                    "initial/final/default_error states must be class "
-                    "descriptors, not instances"
-                )
+        if isinstance(initial_state, State):
+            initial_state = type(initial_state)
+
+        if isinstance(error_state, State):
+            error_state = type(error_state)
 
         self._initial_st = initial_state
-        self._final_st = final_state
-        self._err_st = default_error_state
-        self._msg_queue = msg_queue or Queue()
-        self._timeout_queue = Queue()
-        self._log_fn = log_fn
-        self._transition_fn = transition_fn
-        self._on_err_fn = on_error_fn
+        self._err_state = error_state
+        self._msg_queue = PriorityQueue()
+
+        self._log_fn = log_fn or _do_nothing
+        self._transition_fn = transition_fn or (lambda x, y: None)
+        self._on_err_fn = on_error_fn or (lambda x, y: None)
 
         # Used for pushdown states
         self._state_stack = []
@@ -459,86 +647,40 @@ class StateMachine:
         # (for example, common messages that apply to the process
         # rather than an individual state) and trap unhandled messages
         # (so that one could, for example, raise an exception)
-        self._filter_fn = filter_fn
-        self._trap_fn = trap_fn
+        self._filter_fn = filter_fn or (lambda x, y: None)
+        self._trap_fn = trap_fn or _do_nothing
 
-        self._shared_state = SharedState(self, common_data)
-        self._dwell_states = dwell_states or []
+        self._ctx = SharedContext(
+            send_message=self.send_message,
+            log=self.log,
+            common=common_data or GenericCommon()
+        )
 
         self.reset()
+        
+    @property
+    def context(self) -> SharedContext:
+        return self._ctx
 
-    def start_failsafe_timer(self, duration):
+    def log(self, msg):
+        self._log_fn(msg)
+
+    def _start_failsafe_timer(self, duration):
         def _wrap_timeout(state, timeout):
-            exception = StateTimedOut(
-                f"State {state} timed out after {timeout} seconds"
-            )
-            self._timeout_queue.put(exception)
-            # No-op to make sure tick state machine
-            self._msg_queue.put(None)
+            self._send_message_internal(StateTimedOut(state, timeout))
 
         return Timer(
             duration,
             lambda x, y: _wrap_timeout(x, y),
-            args=[self._current.name, duration],
+            args=[self._current, duration],
         )
 
     def reset_transitions(self):
         # We store transitions and times separately since we don't
         # want slightly different times to affect the set of actual transitions
-        self._transition_id = 0
+        self._transition_id = 0 
         self._transitions = set()
         self._transition_times = collections.defaultdict(list)
-
-    def _transition(self, trans_state):
-        # If the next state is a Push, save the push states on the
-        # state stack and transition to the next state, if a pop, then
-        # try to pull the top state off of the stack. Otherwise, just
-        # transition to the state provided
-        if isinstance(trans_state, Push):
-            if not len(trans_state.push_states):
-                raise NoPushedStatesError("No states provided to push onto the stack")
-            # Push the states on the stack in reverse order, keeping
-            # the first state for the transition
-            for state in reversed(trans_state.push_states[1:]):
-                self._state_stack.append(state)
-            next_state = trans_state.push_states[0]
-        elif isinstance(trans_state, Pop):
-            if len(self._state_stack) == 0:
-                raise EmptyStateStackError("No states on stack!")
-            next_state = self._state_stack.pop()
-        else:
-            next_state = trans_state
-
-        # Calculate time deltas for each transition
-        trans_time = datetime.now()
-        trans_delta = (trans_time - self._last_trans_time).total_seconds()
-        self._last_trans_time = trans_time
-
-        if self._current:
-            cur_name = state_name(self._current)
-            cur_base = base_state_name(self._current)
-        else:
-            cur_name = "None"
-            cur_base = "None"
-
-        next_name = state_name(next_state)
-        next_base = base_state_name(next_state)
-        trans_tup = (cur_base, cur_name, next_base, next_name)
-
-        self._transitions.add(trans_tup)
-        self._transition_times[trans_tup].append((self._transition_id, trans_delta))
-        self._transition_id += 1
-
-        if self._log_fn:
-            self._log_fn(f"State Transition: {cur_name} -> {next_name}")
-        if self._transition_fn:
-            self._transition_fn(next_state, self._shared_state)
-        # If we are preempting another state and haven't cleaned
-        # up the last state, reset it without calling on_leave_handler
-        if self._current and self._current.has_entered:
-            self._current._reset()
-
-        self._current = next_state()
 
     @property
     def mermaid_flowchart(self):
@@ -555,7 +697,6 @@ class StateMachine:
             min_delta = min(deltas, key=lambda x: x[1])[1]
             max_delta = max(deltas, key=lambda x: x[1])[1]
             mean_delta = sum([x[1] for x in deltas]) / len(deltas)
-            print(f"min: {min_delta}, max: {max_delta}, mean: {mean_delta}")
             delta_str = f"{min_delta:.2f} - {max_delta:.2f} ({mean_delta:.2f})"
             transitions += f'  {first} -->|"{delta_str}"| {second}\n'
 
@@ -611,11 +752,12 @@ class StateMachine:
 
     def reset(self):
         self._is_finished = False
+        self.clear_state_stack()
         self._transition(self._initial_st)
 
     def clear_state_stack(self):
         self._state_stack = []
-        
+
     @property
     def current_state_stack(self):
         """Returns a copy of the current state stack."""
@@ -630,101 +772,180 @@ class StateMachine:
         return self._is_finished
 
     def start_non_blocking(self):
-        self._msg_queue.put(None)
         # Still need while loop for getting errors pushed into queue
         while True:
             try:
                 # Still check messages for RetryLimitException
-                msg = self._msg_queue.get()
-                self.tick(msg)
+                self.tick()
             except StateMachineComplete:
                 raise
+
+            # TODO: Test this, seems wrong
             if self._msg_queue.empty():
                 raise NonBlockingStalled(
-                    f"Non-blocking state machine stalled in {state_name(self._current)}"
+                    f"Non-blocking state machine stalled in {self._current.name}"
                 )
 
-    def tick(self, message=None):
-        self._shared_state.msg = message
+    def _log_transition(self, from_st: Optional[State], to_st: State):
+        """
+        Logs a state transition, including the transition details and timing.
 
-        # If this is a filtered message, no reason to call the state
+        Args:
+            from_st: The state transitioning from. Can be None if no prior state exists.
+            to_st: The state transitioning to.
+        """
+        # Calculate time deltas for each transition
+        trans_time = datetime.now()
+        trans_delta = (trans_time - self._last_trans_time).total_seconds()
+        self._last_trans_time = trans_time
+
+        if from_st:
+            from_name = from_st.name
+            from_base = from_st.base_name
+        else:
+            from_name = "None"
+            from_base = "None"
+
+        to_name = to_st.name
+        to_base = to_st.base_name
+        trans_tup = (from_base, from_name, to_base, to_name)
+
+        self._transitions.add(trans_tup)
+        self._transition_times[trans_tup].append((self._transition_id, trans_delta))
+        self._transition_id += 1
+
+        self._log_fn(f"State Transition: {from_name} -> {to_name}")
+
+    def _transition(self, trans_state):
+        next_state = None
+        continuation = False
+        renewal = False
+        retry = False
+        match trans_state:
+            case p if isinstance(p, Push):
+                # If the next state is a Push, save the push states on the
+                # state stack and transition to the next state
+
+                # Push the states on the stack in reverse order, keeping
+                # the first state for the transition
+                for state in reversed(trans_state.push_states[1:]):
+                    self._state_stack.append(state)
+                next_state = trans_state.push_states[0]
+            case type() if issubclass(trans_state, Pop):
+                # For a pop, try to pull the top state off of the stack.
+                # Otherwise, just transition to the state provided
+                if not self._state_stack:
+                    raise EmptyStateStackError("No states on stack!")
+                next_state = self._state_stack.pop()
+            case type() if issubclass(trans_state, State):
+                # For a State, we're just going to transition
+                next_state = trans_state
+            case type() if issubclass(trans_state, (Again, Unhandled)):
+                continuation = True
+            case type() if issubclass(trans_state, Retry):
+                continuation = True
+                retry = True
+                self._current.has_entered = False
+            case type() if issubclass(trans_state, StateRenewal):
+                renewal = True
+
+        if renewal or continuation:
+            next_state = type(self._current)
+
+        transition = type(self._current) != next_state
+
+        self._log_transition(self._current, next_state)
+        self._transition_fn(next_state, self._ctx)
+
+        # If we are preempting another state (as in the case of an error), or we
+        # haven't called on_exit (as is the case in Renewals and Retries), we
+        # need to make sure we've cleared out the failsafe timer.
+        if self._current and (renewal or retry or transition):
+            self._current._cancel_failsafe()
+
+        # Continuations re-use the same state context (to keep track of retries)
+        if not continuation:
+            self._current = next_state()
+
+    def send_message(self, message=None):
+        """Sends a message to the finite state machine"""
+
+        # TODO: Return filtered or not
+        # If this is a filtered message, no reason to give it to the state
         # machine
-
-        is_error_state = isinstance(message, Exception)
-        ok_to_filter = bool(message and self._filter_fn and not is_error_state)
-
-        filter_exception = None
         try:
-            if ok_to_filter and self._filter_fn(self._shared_state):
+            if message and self._filter_fn(self._ctx, message):
                 return
+            # Messages are appended to the right and handled FIFO style
+            self._send_message_internal(message)
         except Exception as e:
-            # Catching any exceptions raised from filtered messages
-            #  to raise them later in the try to pass to the on_error function
-            filter_exception = e
+            # Exceptions are given high priority to ensure we handle them first
+            self._send_message_internal(e)
+
+    def _send_message_internal(self, message):
+        match message:
+            case _ if isinstance(message, EnokiInternalMessage):
+                self._msg_queue.put(
+                    PrioritizedMessage(self.INTERNAL_MESSAGE_PRIORITY, message)
+                )
+            case _ if isinstance(message, Exception):
+                self._msg_queue.put(PrioritizedMessage(self.ERROR_PRIORITY, message))
+            case _:
+                # standard message
+                self._msg_queue.put(PrioritizedMessage(self.MESSAGE_PRIORITY, message))
+
+    def tick(self, timeout: Optional[int] = 0):
+        # Grab our next message
+        # Timeout: 0 = Non blocking (default)
+        # Timeout: None = Blocks forever
+        # Timeout: >0 = Blocks for specific amount
+
+        match timeout:
+            case 0:
+                block = False
+            case None:
+                block = True
+            case x if x > 0:
+                block = True
+            case _:
+                raise ValueError("Tick timeout must be None, or >=0")
 
         fsm_busy = True
         while fsm_busy:
             try:
-                if isinstance(self._current, self._final_st):
-                    self._is_finished = True
+                self._ctx.msg = self._msg_queue.get(block, timeout).item
+            except Empty:
+                self._ctx.msg = None
 
-                if not self._timeout_queue.empty():
-                    raise self._timeout_queue.get()
+            try:
+                self._is_finished = self._current.TERMINAL
 
-                if filter_exception:
-                    raise filter_exception
+                if isinstance(self._ctx.msg, Exception):
+                    raise self._ctx.msg
 
-                next_state = self._current.tick(self._shared_state)
+                next_transition = self._current._tick(self, self._ctx)
 
-                if next_state in BLOCKING_RETURNS:
-                    # If we didn't return anything at all, or we
-                    # returned that we swallowed the message, we'll
-                    # assume that the FSM is no longer busy and is
-                    # waiting on some external message to move the
-                    # state along
+                if next_transition is Unhandled and self._ctx.msg:
+                    # Trap unhandled messages
+                    self._trap_fn(self._ctx)
 
-                    fsm_busy = False
+                # Clear the message
+                self._ctx.msg = None
 
-                    # Additionally, if there is a message, and we
-                    # returned nothing, we'll assume that the state
-                    # didn't handle the message, and trap it.
-                    should_trap = (
-                        self._shared_state.msg and next_state is None and self._trap_fn
-                    )
+                # Transition to our next state
+                self._transition(next_transition)
 
-                    if should_trap:
-                        self._trap_fn(self._shared_state)
-
-                elif next_state:
-                    # If we returned any state clear the message
-                    self._shared_state.msg = None
-                    if state_name(next_state) != self._current.name:
-                        # Make sure timeouts are contained to their own state
-                        if not self._timeout_queue.empty():
-                            self._log_fn(
-                                "Timed out while executing state. " "Moving on anyway."
-                            )
-                            # drop timeout on the floor
-                            e = self._timeout_queue.get()
-                            self._log_fn(str(e))
-                        # Set our current state to the next state
-                        self._transition(next_state)
-
-                fsm_busy = fsm_busy and self._msg_queue.empty()
-            except (StateRetryLimitError, StateTimedOut) as e:
-                self._msg_queue.put(e)
-                break
+                fsm_busy = (not self._msg_queue.empty()) or (not next_transition.AWAITS)
             except Exception as e:
                 # While it's true that 'Pokemon errors' are typically
                 # in poor taste, this allows the user to selectively
                 # handle error cases, and throw any error that isn't
                 # explicitely handled
-                next_state = None
-                filter_exception = None
+                next_transition = None
                 if self._on_err_fn:
-                    next_state = self._on_err_fn(self._shared_state, e)
-                if next_state:
-                    self._transition(next_state)
+                    next_transition = self._on_err_fn(self._ctx, e)
+                if next_transition:
+                    self._transition(next_transition)
                 else:
                     raise e
 
@@ -732,14 +953,11 @@ class StateMachine:
             raise StateMachineComplete
 
         # If the state machine hasn't finished and the current state doesn't
-        # have a timeout or isn't in one of the dwell_states passed in when
-        # creating the state machine at the end of a tick an exception is
-        # raised to indicate that the state machine is stalled.
+        # have a timeout or isn't marked as can dwell at the end of a tick an
+        # exception is raised to indicate that the state machine is stalled.
         if (
             self._msg_queue.empty()
             and self._current.TIMEOUT is None
-            and not any(
-                [isinstance(self._current, d_state) for d_state in self._dwell_states]
-            )
+            and not self._current.CAN_DWELL
         ):
             raise BlockedInUntimedState(self._current)
