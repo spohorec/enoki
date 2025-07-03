@@ -933,7 +933,10 @@ class StateMachine:
                 self._ctx.msg = None
 
                 # Transition to our next state
+                prev = self._current
                 self._transition(next_transition)
+                if block and prev != self._current:
+                    self.send_message(None)
 
                 fsm_busy = (not self._msg_queue.empty()) or (not next_transition.AWAITS)
             except Exception as e:
